@@ -3,6 +3,7 @@ import BinUtils from './bin-utils';
 import { stringToArrayBuffer } from './util/string-to-array-buffer';
 import { transmux } from './segment-transmuxer';
 import { probeMp4StartTime } from './util/segment';
+import { inspect as inspectMp4 } from 'mux.js/lib/tools/mp4-inspector';
 
 const { createTransferableMessage } = BinUtils;
 
@@ -362,18 +363,18 @@ const handleProgress = (segment, progressFn, dataFn) => (event) => {
   const request = event.target;
 
   // don't support encrypted segments or fmp4 for now
-  if (!segment.key && !segment.map) {
+  if (!segment.key) {
     const newBytes = stringToArrayBuffer(
       request.responseText.substring(segment.lastReachedChar || 0));
 
-    segment.lastReachedChar = request.responseText.length;
-
-    handleDecryptedBytes({
+    const decryptedBytes = handleDecryptedBytes({
       segment,
-      bytes: newBytes,
+      bytes: new Uint8Array(newBytes),
       isPartial: true,
       dataFn
     });
+
+    segment.lastReachedChar += decryptedBytes;
   }
 
   segment.stats = videojs.mergeOptions(segment.stats, getProgressStats(event));
@@ -386,6 +387,49 @@ const handleProgress = (segment, progressFn, dataFn) => (event) => {
   return progressFn(event, segment);
 };
 
+const completeMp4BoxesOffset = (bytes) => {
+  let completeBoxesOffset = 0;
+  let remainingBytes = bytes.byteLength - completeBoxesOffset;
+  const view = new DataView(bytes.buffer);
+
+  // 4 bytes for size, 4 bytes for box type
+  while (remainingBytes >= 8) {
+    const boxLength = view.getUint32(completeBoxesOffset);
+
+    if (remainingBytes < boxLength) {
+      // We don't have enough data to parse the full box
+      break;
+    }
+
+    // Update offset to the last complete box
+    completeBoxesOffset += boxLength;
+    remainingBytes -= boxLength;
+  }
+
+  // The number of bytes used
+  return completeBoxesOffset;
+};
+
+const parseMp4AndNotify = ({segment, bytes, isPartial, dataFn, doneFn}) => {
+  const completeBoxesOffset = completeMp4BoxesOffset(bytes);
+  const parsedMp4 = inspectMp4(bytes.subarray(0, completeBoxesOffset));
+
+  console.log('parsedMp4', parsedMp4);
+
+  // const startTime = probeMp4StartTime(bytes, segment.map.bytes);
+
+  // dataFn(segment, {
+  //   data: bytes,
+  //   // TODO
+  //   timingInfo: {
+  //     start: startTime
+  //   }
+  // });
+  // doneFn(null, segment, {});
+
+  return 0;
+};
+
 const handleDecryptedBytes = ({
   segment,
   bytes,
@@ -394,20 +438,13 @@ const handleDecryptedBytes = ({
   doneFn
 }) => {
   if (segment.map) {
-    // fmp4
-    // since we don't support appending fmp4 data on progress, we know we have the full
-    // segment here
-    const startTime = probeMp4StartTime(bytes, segment.map.bytes);
-
-    dataFn(segment, {
-      data: bytes,
-      // TODO
-      timingInfo: {
-        start: startTime
-      }
+    return parseMp4AndNotify({
+      segment,
+      bytes,
+      isPartial,
+      dataFn,
+      doneFn
     });
-    doneFn(null, segment, {});
-    return;
   }
 
   // ts
@@ -418,6 +455,9 @@ const handleDecryptedBytes = ({
     dataFn,
     doneFn
   });
+
+  // TODO: check that the transmuxer can handle any amount of partial data
+  return bytes.byteLength;
 };
 
 const transmuxAndNotify = ({
@@ -428,7 +468,7 @@ const transmuxAndNotify = ({
   doneFn
 }) => {
   transmux({
-    bytes,
+    bytes: bytes.buffer,
     transmuxer: segment.transmuxer,
     audioAppendStart: segment.audioAppendStart,
     gopsToAlignWith: segment.gopsToAlignWith,
